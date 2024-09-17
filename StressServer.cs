@@ -3,6 +3,7 @@
 
 using System;
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
@@ -25,6 +26,8 @@ internal class StressServer
     private Task? _serverTask;
     private Socket _listener;
 
+    private Socket _oobListener;
+
     public StressServer(Configuration config)
     {
         _config = config;
@@ -43,6 +46,13 @@ internal class StressServer
         IPEndPoint ep = config.ServerEndpoint;
         _listener = new Socket(ep.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
         _listener.Bind(ep);
+
+        if (File.Exists(Utils.OobEndpointPath))
+        {
+            File.Delete(Utils.OobEndpointPath);
+        }
+        _oobListener = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+        _oobListener.Bind(new UnixDomainSocketEndPoint(Utils.OobEndpointPath));
     }
 
     public Task Start()
@@ -51,11 +61,23 @@ internal class StressServer
         return _serverTask;
     }
 
-    public Task StopAsync() => Task.CompletedTask;
+    public Task StopAsync()
+    {
+        try
+        {
+            _oobListener.Close();
+            File.Delete(Utils.OobEndpointPath);
+        }
+        catch { }
+        return Task.CompletedTask;
+    }
 
     private async Task StartCore()
     {
         _listener.Listen();
+        _oobListener.Listen();
+
+        using Socket oobSocket = await _oobListener.AcceptAsync();
 
         IEnumerable<Task> workers = Enumerable.Range(1, 2 * _config.MaxConnections).Select(_ => RunSingleWorker());
         try
@@ -69,14 +91,16 @@ internal class StressServer
 
         async Task RunSingleWorker()
         {
+            Memory<byte> oobBuffer = new byte[17];
             while (!_cts.IsCancellationRequested)
             {
                 Log? log = null;
+                bool aborted = false;
                 try
                 {
                     using Socket handlerSocket = await _listener.AcceptAsync(_cts.Token);
                     using WebSocket serverWebSocket = WebSocket.CreateFromStream(new NetworkStream(handlerSocket, ownsSocket: true), _options);
-                    log = await HandleConnection(serverWebSocket, _cts.Token);
+                    (log, aborted) = await HandleConnection(serverWebSocket, _cts.Token);
                 }
                 catch (OperationCanceledException) when (_cts.IsCancellationRequested)
                 {
@@ -101,24 +125,38 @@ internal class StressServer
                         }
                     }
                 }
-                log?.WriteLine("HandleConnection DONE.");
+
+                if (log != null)
+                {
+                    BinaryPrimitives.WriteUInt128BigEndian(oobBuffer.Span, log.ConnectionId);
+                    oobBuffer.Span[16] = aborted ? (byte)1 : (byte)0;
+                    int totalSent = 0;
+                    while (totalSent < oobBuffer.Length)
+                    {
+                        totalSent += await oobSocket.SendAsync(oobBuffer.Slice(totalSent, oobBuffer.Length - totalSent));
+                    }
+
+                    log?.WriteLine($"HandleConnection DONE. aborted={aborted}");
+                }
             }
         }
     }
 
     private static readonly byte[] s_endLine = [(byte)'\n'];
 
-    private async Task<Log> HandleConnection(WebSocket ws, CancellationToken token)
+    private async Task<(Log, bool)> HandleConnection(WebSocket ws, CancellationToken token)
     {
         using CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(token);
         DateTime lastReadTime = DateTime.Now;
 
-        byte[] khem = new byte[8];
-        if ((await ws.ReceiveAsync(khem, token)).MessageType != WebSocketMessageType.Binary)
+        byte[] connectionIdBytes = new byte[16];
+        if ((await ws.ReceiveAsync(connectionIdBytes, token)).MessageType != WebSocketMessageType.Binary)
         {
             throw new Exception("Server failed receiving connectionId.");
         }
-        Log log = new Log("Server", BitConverter.ToInt64(khem));
+
+        UInt128 connectionId = BinaryPrimitives.ReadUInt128BigEndian(connectionIdBytes);
+        Log log = new Log("Server", connectionId);
 
         DataSegmentSerializer serializer = new DataSegmentSerializer(log);
         InputProcessor inputProcessor = new InputProcessor(ws, log);
@@ -133,6 +171,8 @@ internal class StressServer
         {
         }
 
+        bool aborted = inputProcessor.Aborted;
+
         if (!inputProcessor.Aborted)
         {
             log.WriteLine("inputProcessor.RunAsync DONE.  CloseOutputAsync...");
@@ -142,12 +182,13 @@ internal class StressServer
             }
             catch (WebSocketException e) when (e.WebSocketErrorCode == WebSocketError.ConnectionClosedPrematurely || ws.State == WebSocketState.Aborted)
             {
+                aborted = true;
             }
             
             log.WriteLine("CloseOutputAsync DONE.");
         }
 
-        return log;
+        return (log, aborted);
 
         async Task<bool> Callback(ReadOnlySequence<byte> buffer)
         {

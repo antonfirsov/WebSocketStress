@@ -8,9 +8,8 @@ using System.Diagnostics.CodeAnalysis;
 using System.Net.WebSockets;
 using System.Net.Sockets;
 using System.Buffers;
-using System.Net.Security;
-using System;
-using System.Runtime.InteropServices;
+using System.Buffers.Binary;
+
 namespace WebSocketStress;
 
 internal class StressClient
@@ -42,9 +41,14 @@ internal class StressClient
 
     public Task StopAsync() => Task.CompletedTask;
 
-    private Task StartCore()
+    private Dictionary<UInt128, bool> _expectCancellation = new Dictionary<UInt128, bool>();
+
+    private async Task StartCore()
     {
         _stopwatch.Start();
+
+        using Socket oobSocket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+        await oobSocket.ConnectAsync(new UnixDomainSocketEndPoint(Utils.OobEndpointPath));
 
         // Spin up a thread dedicated to outputting stats for each defined interval
         new Thread(() =>
@@ -57,14 +61,50 @@ internal class StressClient
         })
         { IsBackground = true }.Start();
 
+        _ = Task.Run(async () =>
+        {
+            Memory<byte> oobBuffer = new byte[17];
+            while (!_cts.IsCancellationRequested)
+            {
+                int totalReceived = 0;
+                while (totalReceived < oobBuffer.Length)
+                {
+                    totalReceived += await oobSocket.ReceiveAsync(oobBuffer.Slice(totalReceived, oobBuffer.Length - totalReceived));
+                }
+
+                UInt128 connectionId = BinaryPrimitives.ReadUInt128BigEndian(oobBuffer.Span);
+                bool serverAborted = oobBuffer.Span[16] != 0;
+                Log log = new Log("Client", connectionId);
+                log.WriteLine($"!! server aborted: {serverAborted} !!");
+
+                lock (_expectCancellation)
+                {
+                    if (_expectCancellation.TryGetValue(connectionId, out bool clientCanceled))
+                    {
+                        if (serverAborted && !clientCanceled)
+                        {
+                            (int workerId, ulong jobId) = Utils.GetWorkerAndJobId(connectionId);
+                            log.WriteLine($"RecordUnexpectedServerAbort [receiver]");
+                            _aggregator.RecordUnexpectedServerAbort(workerId, jobId);
+                        }
+                        _expectCancellation.Remove(connectionId);
+                    }
+                    else
+                    {
+                        _expectCancellation[connectionId] = serverAborted;
+                    }
+                }
+            }
+        });
+
         IEnumerable<Task> workers = CreateWorkerSeeds().Select(x => RunSingleWorker(x.workerId, x.random));
-        return Task.WhenAll(workers);
+        await Task.WhenAll(workers);
 
         async Task RunSingleWorker(int workerId, Random random)
         {
             StreamCounter counter = _aggregator.GetCounters(workerId);
 
-            for (long jobId = 0; !_cts.IsCancellationRequested; jobId++)
+            for (ulong jobId = 0; !_cts.IsCancellationRequested; jobId++)
             {
                 TimeSpan connectionLifetime = _config.MinConnectionLifetime + random.NextDouble() * (_config.MaxConnectionLifetime - _config.MinConnectionLifetime);
                 TimeSpan cancellationDelay =
@@ -76,7 +116,9 @@ internal class StressClient
                 cts.CancelAfter(cancellationDelay);
 
                 bool isTestCompleted = false;
-                Log log = new Log("Client", (workerId + 1) * jobId);
+                
+                UInt128 connectionId = Utils.GetConnectionId(workerId, jobId);
+                Log log = new Log("Client", connectionId);
                 using CancellationTokenRegistration _ = cts.Token.Register(CheckForStalledConnection);
 
                 cts.Token.Register(() =>
@@ -84,13 +126,14 @@ internal class StressClient
                     log.WriteLine("CANCELLING!!!! ....");
                 });
 
+                bool canceled = false;
                 try
                 {
                     using Socket client = new Socket(_config.ServerEndpoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
                     await client.ConnectAsync(_config.ServerEndpoint, cts.Token);
                     Stream stream = new CountingStream(new NetworkStream(client, ownsSocket: true), counter);
                     using WebSocket clientWebSocket = WebSocket.CreateFromStream(stream, _options);
-                    
+
                     await HandleConnection(workerId, jobId, log, clientWebSocket, random, connectionLifetime, cts.Token);
                     log.WriteLine("HandleConnection succeeded");
                     _aggregator.RecordSuccess(workerId);
@@ -99,6 +142,7 @@ internal class StressClient
                 {
                     log.WriteLine("Cancelled.");
                     _aggregator.RecordCancellation(workerId);
+                    canceled = true;
                 }
                 catch (Exception e)
                 {
@@ -108,6 +152,23 @@ internal class StressClient
                 finally
                 {
                     isTestCompleted = true;
+                }
+
+                lock (_expectCancellation)
+                {
+                    if (_expectCancellation.TryGetValue(connectionId, out bool serverAborted))
+                    {
+                        if (serverAborted && !canceled)
+                        {
+                            log.WriteLine($"RecordUnexpectedServerAbort [worker]");
+                            _aggregator.RecordUnexpectedServerAbort(workerId, jobId);
+                        }
+                        _expectCancellation.Remove(connectionId);
+                    }
+                    else
+                    {
+                        _expectCancellation[connectionId] = canceled;
+                    }
                 }
 
                 log.WriteLine("HandleConnection DONE.");
@@ -143,7 +204,7 @@ internal class StressClient
 
     private static readonly byte[] s_endLine = [(byte)'\n'];
 
-    private async Task HandleConnection(int workerId, long jobId, Log log, WebSocket ws, Random random, TimeSpan duration, CancellationToken token)
+    private async Task HandleConnection(int workerId, ulong jobId, Log log, WebSocket ws, Random random, TimeSpan duration, CancellationToken token)
     {
         // token used for signaling cooperative cancellation; do not pass this to SslStream methods
         log.WriteLine($"Duration: {duration}");
@@ -164,9 +225,9 @@ internal class StressClient
 
         async Task Sender(CancellationToken token)
         {
-            byte[] khem = new byte[8];
-            BitConverter.TryWriteBytes(khem, log.ConnectionId);
-            await ws.WriteAsync(khem, token);
+            byte[] connectionIdBytes = new byte[16];
+            BinaryPrimitives.WriteUInt128BigEndian(connectionIdBytes, log.ConnectionId);
+            await ws.WriteAsync(connectionIdBytes, token);
 
             var serializer = new DataSegmentSerializer(log);
 
@@ -363,6 +424,8 @@ internal class StressClient
                 Console.ResetColor();
             }
         }
+
+        public void RecordUnexpectedServerAbort(int workerId, ulong jobId) => RecordFailure(workerId, new Exception($"Server side WebSocket aborted without client-side cancellation jobId:{jobId}."));
 
         private void UpdateCounters(int workerId)
         {

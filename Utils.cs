@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Buffers;
+using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Runtime.ExceptionServices;
 using System.Text;
@@ -11,7 +12,18 @@ namespace WebSocketStress;
 
 internal static class Utils
 {
+    public static string OobEndpointPath { get; } = Path.Combine(Directory.GetCurrentDirectory(), "oob_socket");
+
     public static Random NextRandom(this Random random) => new Random(Seed: random.Next());
+
+    public static UInt128 GetConnectionId(int workerId, ulong jobId) => new UInt128((ulong)workerId, jobId);
+
+    public static (int workerId, ulong jobId) GetWorkerAndJobId(UInt128 connectionId)
+    {
+        UInt128 jobId = connectionId & (UInt128)ulong.MaxValue;
+        UInt128 workerId = connectionId >> 64;
+        return ((int)workerId, (ulong)jobId);
+    }
 
     public static bool NextBoolean(this Random random, double probability = 0.5)
     {
@@ -241,7 +253,7 @@ internal class DataSegmentSerializer
     }
 }
 
-internal record class Log(string Type, long ConnectionId)
+internal record class Log(string Type, UInt128 ConnectionId)
 {
     private static StreamWriter s_fileWriter;
 
@@ -257,9 +269,9 @@ internal record class Log(string Type, long ConnectionId)
 
     public void WriteLine(string s)
     {
-        //string m = GetMessage(s);
+        string m = GetMessage(s);
         //Console.WriteLine(m);
-        //_ = s_messagesChannel.Writer.WriteAsync(m);
+        _ = s_messagesChannel.Writer.WriteAsync(m);
     }
 
     public void Verbose(string s)

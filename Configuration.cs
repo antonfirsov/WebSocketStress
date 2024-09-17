@@ -2,6 +2,7 @@
 using System.CommandLine;
 using System.Diagnostics.CodeAnalysis;
 using System.Net;
+using System.Net.Sockets;
 using System.Text.RegularExpressions;
 
 namespace WebSocketStress;
@@ -23,6 +24,7 @@ public class Configuration
 
     public TimeSpan MinConnectionLifetime { get; set; }
     public TimeSpan MaxConnectionLifetime { get; set; }
+
 
     public static bool TryParseCli(string[] args, [NotNullWhen(true)] out Configuration? config)
     {

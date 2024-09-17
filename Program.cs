@@ -23,7 +23,7 @@ static async Task Test()
     using WebSocket serverWs = WebSocket.CreateFromStream(new NetworkStream(handlerSock, ownsSocket: true), isServer: true, null, TimeSpan.Zero);
     using WebSocket clientWs = WebSocket.CreateFromStream(new NetworkStream(clientSock, ownsSocket: true), isServer: false, null, TimeSpan.Zero);
 
-    Log log = new Log("Test", 42);
+    Log log = new Log("Test", 1235);
 
     DataSegment sent = DataSegment.CreateRandom(Random.Shared, 10);
     Console.WriteLine(sent);
