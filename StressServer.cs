@@ -77,6 +77,8 @@ internal class StressServer
         _listener.Listen();
         _oobListener.Listen();
 
+        // An out-of-band UDS socket to report WebSocket closure status (normal, aborted) to the client.
+        // Aborted status is only valid if the client initiated cancellation.
         using Socket oobSocket = await _oobListener.AcceptAsync();
 
         IEnumerable<Task> workers = Enumerable.Range(1, 2 * _config.MaxConnections).Select(_ => RunSingleWorker());

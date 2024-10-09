@@ -1,8 +1,7 @@
 {
   "profiles": {
     "WebSocketStress": {
-      "commandName": "Project",
-      "commandLineArgs": "-p 0.7 -n 1 -S -l 2 -L 15"
+      "commandName": "Project"
     }
   }
 }

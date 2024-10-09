@@ -47,6 +47,8 @@ internal class StressClient
     {
         _stopwatch.Start();
 
+        // An out-of-band UDS socket so the server can report WebSocket close status (normal, aborted) to the client.
+        // Aborted status is only valid if the client initiated cancellation.
         using Socket oobSocket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
         await oobSocket.ConnectAsync(new UnixDomainSocketEndPoint(Utils.OobEndpointPath));
 
@@ -61,8 +63,10 @@ internal class StressClient
         })
         { IsBackground = true }.Start();
 
+        // Spin up a Task to monitor oobSocket
         _ = Task.Run(async () =>
         {
+            // 16 bytes for the ConnectionId, 1 for close status.
             Memory<byte> oobBuffer = new byte[17];
             while (!_cts.IsCancellationRequested)
             {
